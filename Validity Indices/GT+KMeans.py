@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 from scipy.spatial.distance import cdist
+from sklearn.cluster import KMeans
 from sklearn.metrics import silhouette_score, calinski_harabasz_score
 from sklearn.preprocessing import StandardScaler, OneHotEncoder
 from sklearn.compose import ColumnTransformer
@@ -29,29 +30,27 @@ def load_and_preprocess(file_path):
 
 
 # -----------------------------
-# GENERAL TREND EXTRACTION (FAST)
+# GENERAL TREND EXTRACTION
 # -----------------------------
 def compute_general_trend(X):
     """
-    Vectorized trend computation (much faster than loop)
+    Extracts trend strength per feature using variance + slope idea
     """
-    # variance
-    var = np.var(X, axis=0)
+    trends = np.zeros(X.shape[1])
 
-    # slope (vectorized)
-    x_axis = np.arange(X.shape[0])
-    x_mean = np.mean(x_axis)
-    denom = np.sum((x_axis - x_mean) ** 2)
-
-    slopes = []
     for i in tqdm(range(X.shape[1]), desc="Computing trends"):
-        y = X[:, i]
-        slope = np.sum((x_axis - x_mean) * (y - np.mean(y))) / denom
-        slopes.append(slope)
+        feature = X[:, i]
 
-    slopes = np.array(slopes)
+        # Trend strength = variance + linear slope magnitude
+        var = np.var(feature)
 
-    trends = var + np.abs(slopes)
+        # simple slope (least squares)
+        x_axis = np.arange(len(feature))
+        slope = np.polyfit(x_axis, feature, 1)[0]
+
+        trends[i] = var + abs(slope)
+
+    # Normalize
     trends = trends / np.max(trends)
 
     return trends
@@ -106,63 +105,34 @@ def xie_beni_index(X, labels, centers):
 
 
 # -----------------------------
-# FCM (FAST + STABLE)
+# GENERAL TREND + KMEANS
 # -----------------------------
-class FuzzyCMeans:
-    def __init__(self, n_clusters=3, m=2, max_iter=100, tol=1e-4):
-        self.k = n_clusters
-        self.m = m
-        self.max_iter = max_iter
-        self.tol = tol
-
-    def fit(self, X):
-        n = X.shape[0]
-
-        # Random init
-        idx = np.random.choice(n, self.k, replace=False)
-        centers = X[idx]
-
-        for _ in tqdm(range(self.max_iter), desc="FCM Optimization"):
-            dist = cdist(X, centers) + 1e-8
-
-            power = 2 / (self.m - 1)
-            inv_dist = 1.0 / dist
-            temp = inv_dist ** power
-            U = temp / np.sum(temp, axis=1, keepdims=True)
-
-            U_m = U ** self.m
-            new_centers = (U_m.T @ X) / np.sum(U_m.T, axis=1, keepdims=True)
-
-            if np.linalg.norm(new_centers - centers) < self.tol:
-                break
-
-            centers = new_centers
-
-        labels = np.argmax(U, axis=1)
-        return labels, centers
-
-
-# -----------------------------
-# TREND + FCM
-# -----------------------------
-class Trend_FCM:
+class Trend_KMeans:
     def __init__(self, n_clusters=3):
         self.k = n_clusters
 
     def fit(self, X):
-        print("Extracting trends...")
-        weights = compute_general_trend(X)
+        print("Extracting general trends...")
+        trend_weights = compute_general_trend(X)
 
-        X_weighted = X * weights
+        # Apply weights
+        X_weighted = X * trend_weights
 
-        print("Running FCM...")
-        fcm = FuzzyCMeans(n_clusters=self.k)
-        labels, centers = fcm.fit(X_weighted)
+        print("Running KMeans...")
+        kmeans = KMeans(
+            n_clusters=self.k,
+            init="k-means++",
+            n_init=10,
+            max_iter=300,
+            random_state=42
+        )
+
+        labels = kmeans.fit_predict(X_weighted)
 
         self.labels = labels
-        self.centers = centers
+        self.centers = kmeans.cluster_centers_
 
-        return labels, centers
+        return labels, self.centers
 
 
 # -----------------------------
@@ -174,7 +144,7 @@ if __name__ == "__main__":
     print("Loading data...")
     X = load_and_preprocess(file_path)
 
-    model = Trend_FCM(n_clusters=3)
+    model = Trend_KMeans(n_clusters=3)
     labels, centers = model.fit(X)
 
     print("\nCalculating metrics...")
@@ -185,7 +155,7 @@ if __name__ == "__main__":
     xb = xie_beni_index(X, labels, centers)
     ch = calinski_harabasz_score(X, labels)
 
-    print("\nFinal Results (Trend + FCM):")
+    print("\nFinal Results (Trend + KMeans):")
     print(f"Silhouette Score      : {sil:.4f}")
     print(f"Davies-Bouldin Index : {db:.4f}")
     print(f"Dunn Index           : {dunn:.4f}")
